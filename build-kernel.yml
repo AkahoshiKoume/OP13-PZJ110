@@ -1,0 +1,183 @@
+name: Build OnePlus 13 Kernel (SukiSU + SUSFS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest_branch:
+        description: "OnePlusOSS/kernel_manifest 分支"
+        default: "oneplus/sm8750"
+      manifest_file:
+        description: "manifest 文件名（对应 15.0.0.861 的版本，去仓库里确认）"
+        default: "oneplus_13.xml"
+      ksu_branch:
+        description: "SukiSU setup.sh 参数"
+        default: "susfs-main"
+      susfs_branch:
+        description: "susfs4ksu 分支"
+        default: "gki-android15-6.6"
+      build_anykernel:
+        description: "同时输出 AnyKernel3 zip（boot.img 刷失败时可用 Kernel Flasher 刷它）"
+        type: boolean
+        default: true
+      anykernel_repo:
+        description: "AnyKernel3 仓库"
+        default: "https://github.com/WildKernels/AnyKernel3.git"
+      ota_url:
+        description: "全量 OTA 包链接（含 payload.bin），用来提取原厂 boot.img"
+        default: "https://gauss-compotacostauto-cn.allawnfs.com/remove-e6e9aeebe94ab0221233604074f25b67/component-ota/25/09/19/d92cb1e567994a4eb1700351ee09d71d.zip"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - name: 释放磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force || true
+          sudo apt-get clean
+          df -h /
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git curl python3 build-essential bc bison flex \
+            libssl-dev libelf-dev zip unzip rsync cpio
+          mkdir -p ~/bin
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod +x ~/bin/repo
+          echo "$HOME/bin" >> $GITHUB_PATH
+          git config --global user.name "builder"
+          git config --global user.email "builder@example.com"
+
+      - name: 拉取一加内核源码
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/work && cd $GITHUB_WORKSPACE/work
+          repo init -u https://github.com/OnePlusOSS/kernel_manifest.git \
+            -b refs/heads/${{ inputs.manifest_branch }} \
+            -m ${{ inputs.manifest_file }} --depth=1
+          repo sync -c --no-tags --no-clone-bundle -j$(nproc)
+
+      - name: 去除 GKI 保护与 dirty 标记
+        working-directory: work
+        run: |
+          rm -rf kernel_platform/common/android/abi_gki_protected_exports_* || true
+          rm -rf kernel_platform/msm-kernel/android/abi_gki_protected_exports_* || true
+          for f in kernel_platform/common/scripts/setlocalversion \
+                   kernel_platform/msm-kernel/scripts/setlocalversion; do
+            [ -f "$f" ] && sed -i 's/-dirty//' "$f"
+          done
+
+      - name: 对齐内核版本字符串
+        working-directory: work/kernel_platform/common
+        run: |
+          # 目标: 6.6.66-android15-8-g29d86c5fc9dd-abogki428889875-4k
+          SUB=$(grep -m1 '^SUBLEVEL' Makefile | awk '{print $3}')
+          echo "源码 SUBLEVEL = $SUB (手机为 66)"
+          [ "$SUB" = "66" ] || { echo "::error::源码小版本不是 66，换对应的 manifest"; exit 1; }
+          sed -i '$s|echo "\$res"|echo "-android15-8-g29d86c5fc9dd-abogki428889875-4k"|' scripts/setlocalversion
+          tail -n 5 scripts/setlocalversion
+
+      - name: 集成 SukiSU Ultra
+        working-directory: work/kernel_platform/common
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
+            | bash -s ${{ inputs.ksu_branch }}
+
+      - name: 打 SUSFS 补丁
+        working-directory: work/kernel_platform/common
+        run: |
+          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git \
+            -b ${{ inputs.susfs_branch }} $GITHUB_WORKSPACE/susfs4ksu
+          cp $GITHUB_WORKSPACE/susfs4ksu/kernel_patches/fs/* fs/
+          cp $GITHUB_WORKSPACE/susfs4ksu/kernel_patches/include/linux/* include/linux/
+          PATCH=$(ls $GITHUB_WORKSPACE/susfs4ksu/kernel_patches/50_add_susfs_in_gki-*.patch | head -n1)
+          echo "使用补丁: $PATCH"
+          patch -p1 --no-backup-if-mismatch < "$PATCH" || true
+          if find . -name '*.rej' | grep -q .; then
+            echo "::error::补丁有冲突，需要手动合并："
+            find . -name '*.rej'
+            exit 1
+          fi
+
+      - name: 写入 defconfig
+        working-directory: work/kernel_platform/common
+        run: |
+          cat >> arch/arm64/configs/gki_defconfig <<'EOF'
+          CONFIG_KSU=y
+          CONFIG_KPROBES=y
+          CONFIG_HAVE_KPROBES=y
+          CONFIG_KPROBE_EVENTS=y
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          EOF
+          # heredoc 缩进清理
+          sed -i 's/^[[:space:]]*\(CONFIG_\)/\1/' arch/arm64/configs/gki_defconfig
+
+      - name: 编译内核
+        working-directory: work
+        run: |
+          chmod +x kernel_platform/oplus/build/oplus_build_kernel.sh
+          ./kernel_platform/oplus/build/oplus_build_kernel.sh sun perf
+
+      - name: 清理源码腾出空间
+        run: |
+          IMG=$(find $GITHUB_WORKSPACE/work -name Image -path '*dist*' | head -n1)
+          [ -z "$IMG" ] && IMG=$(find $GITHUB_WORKSPACE/work -name Image | head -n1)
+          echo "Image: $IMG"
+          [ -z "$IMG" ] && { echo "::error::没找到 Image"; exit 1; }
+          cp "$IMG" $GITHUB_WORKSPACE/Image
+          rm -rf $GITHUB_WORKSPACE/work
+          df -h /
+
+      - name: 从 OTA 提取原厂 boot.img
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/pack && cd $GITHUB_WORKSPACE/pack
+          curl -L --fail -o ota.zip "${{ inputs.ota_url }}"
+          unzip -j ota.zip payload.bin || { echo "::error::zip 里没有 payload.bin，可能不是全量包"; exit 1; }
+          rm -f ota.zip
+          curl -L --fail -o pdg.tar.gz https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz
+          tar xzf pdg.tar.gz
+          ./payload-dumper-go -p boot -o out payload.bin
+          ls -lh out
+          strings out/boot.img | grep -m1 "Linux version" || true
+
+      - name: 替换内核并重打包 boot.img
+        working-directory: pack
+        run: |
+          curl -L --fail -o magisk.apk https://github.com/topjohnwu/Magisk/releases/download/v28.1/Magisk-v28.1.apk
+          unzip -j magisk.apk lib/x86_64/libmagiskboot.so -d .
+          mv libmagiskboot.so magiskboot && chmod +x magiskboot
+          cp out/boot.img boot.img
+          ./magiskboot unpack boot.img
+          cp $GITHUB_WORKSPACE/Image kernel
+          ./magiskboot repack boot.img
+          mv new-boot.img OP13-SukiSU-SUSFS-boot.img
+          ls -lh OP13-SukiSU-SUSFS-boot.img
+          strings OP13-SukiSU-SUSFS-boot.img | grep -m1 "Linux version" || true
+
+      - name: 上传 boot.img
+        uses: actions/upload-artifact@v4
+        with:
+          name: OP13-SukiSU-SUSFS-boot
+          path: pack/OP13-SukiSU-SUSFS-boot.img
+
+      - name: 打包 AnyKernel3（可选）
+        if: ${{ inputs.build_anykernel }}
+        run: |
+          git clone --depth=1 ${{ inputs.anykernel_repo }} AnyKernel3
+          rm -rf AnyKernel3/.git
+          cp $GITHUB_WORKSPACE/Image AnyKernel3/Image
+          cd AnyKernel3 && zip -r9 ../OP13-SukiSU-SUSFS-AnyKernel3.zip . -x '*.git*'
+
+      - name: 上传 AnyKernel3 zip
+        if: ${{ inputs.build_anykernel }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: OP13-SukiSU-SUSFS-AnyKernel3
+          path: OP13-SukiSU-SUSFS-AnyKernel3.zip
